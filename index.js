@@ -17,7 +17,6 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
-var clearTimeout = require('timers').clearTimeout;
 var EventEmitter = require('events').EventEmitter;
 var fs = require('fs');
 var metrics = require('metrics');
@@ -26,6 +25,7 @@ var TypedError = require('error/typed');
 var AdminJoiner = require('./lib/swim').AdminJoiner;
 var createRingPopTChannel = require('./lib/tchannel.js').createRingPopTChannel;
 var Dissemination = require('./lib/members').Dissemination;
+var Gossip = require('./lib/swim.js').Gossip;
 var HashRing = require('./lib/ring');
 var Membership = require('./lib/members').Membership;
 var MemberIterator = require('./lib/members').MemberIterator;
@@ -34,6 +34,7 @@ var PingReqSender = require('./lib/swim').PingReqSender;
 var PingSender = require('./lib/swim').PingSender;
 var safeParse = require('./lib/util').safeParse;
 var RequestProxy = require('./lib/request-proxy');
+var Suspicion = require('./lib/swim.js').Suspicion;
 
 var IP_PATTERN = /^(\d+.\d+.\d+.\d+):\d+$/;
 var MAX_JOIN_DURATION = 300000;
@@ -51,6 +52,16 @@ var InvalidJoinSourceError = TypedError({
     message:  'A node tried joining a cluster by attempting to join itself.' +
         ' The joiner ({actual}) must join someone else.',
     actual: null
+});
+
+var InvalidLeaveLocalMemberError = TypedError({
+    type: 'ringpop.invalid-leave.local-member',
+    message: 'An admin leave was attempted before the local member was added to the membership'
+});
+
+var RedundantLeaveError = TypedError({
+    type: 'ringpop.invalid-leave.redundant',
+    message: 'A node cannot leave its cluster when it has already left.'
 });
 
 function RingPop(options) {
@@ -78,7 +89,6 @@ function RingPop(options) {
     this.lastProtocolPeriod = Date.now();
     this.lastProtocolRate = 0;
     this.protocolPeriods = 0;
-    this.suspectPeriod = 5000;
     this.maxJoinDuration = options.maxJoinDuration || MAX_JOIN_DURATION;
 
     this.requestProxy = new RequestProxy(this);
@@ -87,6 +97,8 @@ function RingPop(options) {
     this.membership = new Membership(this);
     this.membership.on('updated', this.onMembershipUpdated.bind(this));
     this.memberIterator = new MemberIterator(this);
+    this.gossip = new Gossip(this);
+    this.suspicion = new Suspicion(this);
 
     this.timing = new metrics.Histogram();
     this.timing.update(this.minProtocolPeriod);
@@ -94,9 +106,7 @@ function RingPop(options) {
     this.serverRate = new metrics.Meter();
     this.totalRate = new metrics.Meter();
 
-    this.gossipTimer = null;
     this.protocolRateTimer = null;
-    this.suspectTimers = {};
 
     this.statHostPort = this.hostPort.replace(':', '_');
     this.statPrefix = 'ringpop.' + this.statHostPort;
@@ -109,7 +119,8 @@ require('util').inherits(RingPop, EventEmitter);
 
 RingPop.prototype.destroy = function destroy() {
     this.destroyed = true;
-    clearTimeout(this.gossipTimer);
+    this.gossip.stop();
+    this.suspicion.stopAll();
     clearInterval(this.protocolRateTimer);
 
     this.clientRate.m1Rate.stop();
@@ -126,11 +137,6 @@ RingPop.prototype.destroy = function destroy() {
         this.joiner.destroy();
     }
 
-    Object.keys(this.suspectTimers)
-        .forEach(function clearSuspect(timerKey) {
-            clearTimeout(this.suspectTimers[timerKey]);
-        }, this);
-
     if (this.channel) {
         this.channel.quit();
     }
@@ -140,7 +146,17 @@ RingPop.prototype.setupChannel = function setupChannel() {
     createRingPopTChannel(this, this.channel);
 };
 
+RingPop.prototype.addLocalMember = function addLocalMember() {
+    this.membership.addMember({ address: this.hostPort });
+};
+
 RingPop.prototype.adminJoin = function adminJoin(target, callback) {
+    if (this.membership.localMember.status === 'leave') {
+        return this.rejoin(function() {
+            callback(null, null, 'rejoined');
+        });
+    }
+
     if (this.joiner) {
         this.joiner.destroy();
         this.joiner = null;
@@ -153,6 +169,23 @@ RingPop.prototype.adminJoin = function adminJoin(target, callback) {
         maxJoinDuration: this.maxJoinDuration
     });
     this.joiner.sendJoin();
+};
+
+RingPop.prototype.adminLeave = function adminLeave(callback) {
+    if (!this.membership.localMember) {
+        return callback(InvalidLeaveLocalMemberError());
+    }
+
+    if (this.membership.localMember.status === 'leave') {
+        return callback(RedundantLeaveError());
+    }
+
+    // TODO Explicitly infect other members (like admin join)?
+    this.membership.makeLeave();
+    this.gossip.stop();
+    this.suspicion.stopAll();
+
+    callback(null, null, 'ok');
 };
 
 RingPop.prototype.bootstrap = function bootstrap(bootstrapFile, callback) {
@@ -187,8 +220,7 @@ RingPop.prototype.bootstrap = function bootstrap(bootstrapFile, callback) {
     this.checkForMissingBootstrapHost();
     this.checkForHostnameIpMismatch();
 
-    // Add local member
-    this.membership.addMember({ address: this.hostPort });
+    this.addLocalMember();
 
     this.adminJoin(function(err) {
         if (err) {
@@ -241,7 +273,6 @@ RingPop.prototype.checkForMissingBootstrapHost = function checkForMissingBootstr
 
     return true;
 };
-
 
 RingPop.prototype.checkForHostnameIpMismatch = function checkForHostnameIpMismatch() {
     var self = this;
@@ -307,26 +338,6 @@ RingPop.prototype.getStats = function getStats() {
         },
         ring: Object.keys(this.ring.servers)
     };
-};
-
-RingPop.prototype.gossip = function gossip() {
-    var self = this;
-    var start = new Date();
-
-    if (this.destroyed) {
-        return;
-    }
-
-    function callback() {
-        self.stat('timing', 'protocol.frequency', start);
-        self.gossip();
-    }
-
-    var protocolDelay = this.computeProtocolDelay();
-    this.stat('timing', 'protocol.delay', protocolDelay);
-    this.gossipTimer = setTimeout(function () {
-        self.pingMemberNow(callback);
-    }, protocolDelay);
 };
 
 RingPop.prototype.handleTick = function handleTick(cb) {
@@ -436,11 +447,6 @@ RingPop.prototype.whoami = function whoami() {
     return this.hostPort;
 };
 
-RingPop.prototype.clearSuspectTimeout = function clearSuspectTimeout(member) {
-    this.logger.debug('canceled suspect period member=' + member.address);
-    clearTimeout(this.suspectTimers[member.address]);
-};
-
 RingPop.prototype.computeProtocolDelay = function computeProtocolDelay() {
     if (this.protocolPeriods) {
         var target = this.lastProtocolPeriod + this.lastProtocolRate;
@@ -459,14 +465,14 @@ RingPop.prototype.onMembershipUpdated = function onMembershipUpdated(updates) {
     var self = this;
 
     var updateHandlers = {
-        'alive': function onAliveMember(member) {
+        alive: function onAliveMember(member) {
             /* jshint camelcase: false */
             self.stat('increment', 'membership-update.alive');
             self.logger.info('member is alive', {
                 local: self.membership.localMember.address,
                 alive: member.address
             });
-            self.clearSuspectTimeout(member);
+            self.suspicion.stop(member);
             self.ring.addServer(member.address);
             self.dissemination.addChange({
                 address: member.address,
@@ -475,14 +481,14 @@ RingPop.prototype.onMembershipUpdated = function onMembershipUpdated(updates) {
                 piggybackCount: 0
             });
         },
-        'faulty': function onFaultyMember(member) {
+        faulty: function onFaultyMember(member) {
             /* jshint camelcase: false */
             self.stat('increment', 'membership-update.faulty');
             self.logger.warn('member is faulty', {
                 local: self.membership.localMember.address,
                 faulty: member.address
             });
-            self.clearSuspectTimeout(member);
+            self.suspicion.stop(member);
             self.ring.removeServer(member.address);
             self.dissemination.addChange({
                 address: member.address,
@@ -491,7 +497,23 @@ RingPop.prototype.onMembershipUpdated = function onMembershipUpdated(updates) {
                 piggybackCount: 0
             });
         },
-        'new': function onNewMember(member) {
+        leave: function onLeaveMember(member) {
+            /* jshint camelcase: false */
+            self.stat('increment', 'membership-update.leave');
+            self.logger.warn('member has left', {
+                local: self.membership.localMember.address,
+                leave: member.address
+            });
+            self.suspicion.stop(member);
+            self.ring.removeServer(member.address);
+            self.dissemination.addChange({
+                address: member.address,
+                status: member.status,
+                incarnationNumber: member.incarnationNumber,
+                piggybackCount: 0
+            });
+        },
+        new: function onNewMember(member) {
             /* jshint camelcase: false */
             self.stat('increment', 'membership-update.new');
             self.ring.addServer(member.address);
@@ -502,13 +524,13 @@ RingPop.prototype.onMembershipUpdated = function onMembershipUpdated(updates) {
                 piggybackCount: 0
             });
         },
-        'suspect': function onSuspectMember(member) {
+        suspect: function onSuspectMember(member) {
             self.stat('increment', 'membership-update.suspect');
             self.logger.warn('member is suspect', {
                 local: self.membership.localMember.address,
                 suspect: member.address
             });
-            self.startSuspectPeriod(member);
+            self.suspicion.start(member);
             self.dissemination.addChange({
                 address: member.address,
                 status: member.status,
@@ -602,6 +624,17 @@ RingPop.prototype.readHostsFile = function readHostsFile(file) {
     }
 };
 
+RingPop.prototype.rejoin = function rejoin(callback) {
+    this.membership.makeAlive();
+
+    this.gossip.restart();
+    this.suspicion.reenable();
+
+    // TODO Rejoin may eventually necessitate fan-out thus
+    // the need for the asynchronous-style callback.
+    callback();
+};
+
 RingPop.prototype.seedBootstrapHosts = function seedBootstrapHosts(file) {
     if (Array.isArray(file)) {
         this.bootstrapHosts = file;
@@ -679,7 +712,7 @@ RingPop.prototype.startProtocolPeriod = function startProtocolPeriod() {
 
     this.isRunning = true;
     this.membership.shuffle();
-    this.gossip();
+    this.gossip.start();
     this.logger.info('ringpop has started gossiping', { address: this.hostPort });
 };
 
@@ -687,32 +720,6 @@ RingPop.prototype.startProtocolRateTimer = function startProtocolRateTimer() {
     this.protocolRateTimer = setInterval(function () {
         this.lastProtocolRate = this.protocolRate();
     }.bind(this), 1000);
-};
-
-RingPop.prototype.startSuspectPeriod = function startSuspectPeriod(member) {
-    if (this.destroyed) {
-        return;
-    }
-
-    this.logger.debug('starting suspect period member=' + member.address);
-
-    // An existing suspect could exist in the event that a previously suspected
-    // member is still suspected, but overriden by a higher incarnation number.
-    // In that case, this function effectively renews and reissues a suspect
-    // period.
-    if (this.suspectTimers[member.address]) {
-        this.logger.debug('canceling existing suspect period suspect=' + member.address);
-        clearTimeout(this.suspectTimers[member.address]);
-    }
-
-    this.suspectTimers[member.address] = setTimeout(function() {
-        this.membership.update([{
-            address: member.address,
-            incarnationNumber: member.incarnationNumber,
-            status: 'faulty'
-        }]);
-        delete this.suspectTimers[member.address];
-    }.bind(this), this.suspectPeriod);
 };
 
 RingPop.prototype.stat = function stat(type, key, value) {

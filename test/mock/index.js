@@ -17,9 +17,12 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
+var path = require('path');
 
-module.exports = {
-    channel: require('./channel.js'),
-    logger: require('./logger.js'),
-    membership: require('./membership.js')
-};
+require('glob').sync(__dirname + '/**/*.js').forEach(function(file) {
+    var basename = path.basename(file, '.js');
+
+    if (basename !== 'index') {
+        module.exports[basename] = require(file);
+    }
+});
