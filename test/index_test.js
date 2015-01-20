@@ -53,6 +53,22 @@ test('key hashes to only server', function t(assert) {
     assert.end();
 });
 
+test('admin join cannot be performed before local member is added to membership', function t(assert) {
+    assert.plan(2);
+
+    var ringpop = new RingPop({
+        app: 'ringpop',
+        hostPort: '127.0.0.1:3000'
+    });
+
+    ringpop.adminJoin(null, function(err) {
+        assert.ok(err, 'an error occurred');
+        assert.equals(err.type, 'ringpop.invalid-local-member', 'invalid local member error');
+    });
+
+    assert.end();
+});
+
 test('admin leave prevents redundant leave', function t(assert) {
     assert.plan(2);
 
@@ -119,7 +135,7 @@ test('admin leave cannot be attempted before local member is added', function t(
 
     ringpop.adminLeave(function(err) {
         assert.ok(err, 'an error occurred');
-        assert.equals(err.type, 'ringpop.invalid-leave.local-member', 'an invalid leave occurred');
+        assert.equals(err.type, 'ringpop.invalid-local-member', 'an invalid leave occurred');
         assert.end();
     });
 });

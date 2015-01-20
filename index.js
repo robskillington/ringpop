@@ -54,9 +54,9 @@ var InvalidJoinSourceError = TypedError({
     actual: null
 });
 
-var InvalidLeaveLocalMemberError = TypedError({
-    type: 'ringpop.invalid-leave.local-member',
-    message: 'An admin leave was attempted before the local member was added to the membership'
+var InvalidLocalMemberError = TypedError({
+    type: 'ringpop.invalid-local-member',
+    message: 'Operation could not be performed because local member has not been added to membership'
 });
 
 var RedundantLeaveError = TypedError({
@@ -151,6 +151,10 @@ RingPop.prototype.addLocalMember = function addLocalMember() {
 };
 
 RingPop.prototype.adminJoin = function adminJoin(target, callback) {
+    if (!this.membership.localMember) {
+        return callback(InvalidLocalMemberError());
+    }
+
     if (this.membership.localMember.status === 'leave') {
         return this.rejoin(function() {
             callback(null, null, 'rejoined');
@@ -173,7 +177,7 @@ RingPop.prototype.adminJoin = function adminJoin(target, callback) {
 
 RingPop.prototype.adminLeave = function adminLeave(callback) {
     if (!this.membership.localMember) {
-        return callback(InvalidLeaveLocalMemberError());
+        return callback(InvalidLocalMemberError());
     }
 
     if (this.membership.localMember.status === 'leave') {
