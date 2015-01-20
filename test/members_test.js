@@ -54,7 +54,7 @@ test('change with same incarnation number does not result in leave override', fu
     assert.end();
 });
 
-test('change with lower incarnation umber does not result in leave override', function t(assert) {
+test('change with lower incarnation number does not result in leave override', function t(assert) {
     var member = { status: 'alive', incarnationNumber: 1 };
     var change = { status: 'leave', incarnationNumber: 0 };
 
