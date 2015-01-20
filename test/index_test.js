@@ -53,6 +53,21 @@ test('key hashes to only server', function t(assert) {
     assert.end();
 });
 
+test('admin join rejoins if member has previously left', function t(assert) {
+    assert.plan(3);
+
+    var ringpop = new RingPop({ app: 'ringpop', hostPort: '127.0.0.1:3000' });
+    ringpop.addLocalMember();
+    ringpop.adminLeave(function(err, _, res2) {
+        assert.equals(res2, 'ok', 'node left cluster');
+    });
+    ringpop.adminJoin(null, function(err, _, res2) {
+        assert.equals(res2, 'rejoined', 'node rejoined cluster');
+    });
+    assert.equals(ringpop.membership.localMember.status, 'alive', 'local member is alive');
+    assert.end();
+});
+
 test('admin join cannot be performed before local member is added to membership', function t(assert) {
     assert.plan(2);
 
